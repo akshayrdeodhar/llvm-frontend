@@ -33,7 +33,6 @@ static int gettok(void){
 	    IdentifierString += LastChar;
 	    LastChar = getchar();
 	}
-
 	if (IdentifierString == "def"){
 	    return tok_def;
 	}
@@ -44,10 +43,9 @@ static int gettok(void){
 	    return tok_identifier;
 	}
     }
-
     else if (isdigit(LastChar) || LastChar == '.'){
 	std::string NumStr = "";
-	bool decimal = (LastChar == '.');
+	bool decimal = false;
 	while(isdigit(LastChar) || (!decimal && (LastChar == '.'))){
 	    NumStr += LastChar;
 	    if (LastChar == '.') {
@@ -64,12 +62,12 @@ static int gettok(void){
 	return tok_number;
     }
     else if (LastChar == '#'){
-	while(LastChar != '\n' && LastChar != EOF && LastChar != '\r'){
+	while(LastChar != EOF && LastChar != '\n' && LastChar != '\r') {
 	    LastChar = getchar();
 	}
 
 	if (LastChar != EOF){
-	    gettok(); // LOL, cheap trick, but well played
+	    return gettok(); // LOL, cheap trick, but well played
 	}
     }
     else if (LastChar == EOF){
@@ -87,29 +85,27 @@ static int gettok(void){
 int main(void) {
     int Token;
     while((Token = gettok())){
-	if (Token == tok_number){
-	    std::cout << "(" << Token << ", " <<  Value << ")" << std::endl;
-	}
-	else if (Token == tok_identifier) {
-	    std::cout << "(" << Token << ", " << IdentifierString << ")" << std::endl;
-	}
-	else if (Token != tok_eof){
-	    std::cout << "(" << "'" << (char)Token << "', " << 0 << ")" << std::endl;
-	}
-	else{
-	    std::cout << "End.";
-	    break;
+	switch(Token) {
+	    case tok_number:
+		std::cout << "(" << Token << ", " <<  Value << ")" << std::endl;
+		break;
+	    case tok_identifier:
+		std::cout << "(" << Token << ", " << IdentifierString << ")" << std::endl;
+		break;
+	    case tok_def: case tok_extern:
+		std::cout << "(" << Token << ", " << IdentifierString << ")" << std::endl;
+		break;
+	    case tok_eof:
+		std::cout << "(" << "End" << "," << 0 << ")" << std::endl;
+		return 0;
+		break;
+	    case tok_error:
+		std::cout << "(" << "Error" << "," << 0 << ")" << std::endl;
+		break;
+	    default:
+		std::cout << "(" << (char)Token << "," << 0 << ")" << std::endl;
+		break;
 	}
     }
     return 0;
 }
-
-
-
-
-
-
-
-
-
-
