@@ -1,5 +1,5 @@
 kaleidoscope: kaleidoscope.cpp
-	clang++ kaleidoscope.cpp -o kaleidoscope
+	clang++ -Wall -fsanitize=address kaleidoscope.cpp -o kaleidoscope 
 
 test: kaleidoscope fib.k
 	cat fib.k | ./kaleidoscope
