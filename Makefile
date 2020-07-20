@@ -1,5 +1,5 @@
 kaleidoscope: kaleidoscope.cpp
-	clang++ -Wall -fsanitize=address kaleidoscope.cpp -o kaleidoscope 
+	clang++ -g -O3 -Wall kaleidoscope.cpp `llvm-config --cxxflags --ldflags --system-libs --libs core` -o kaleidoscope
 
 test: kaleidoscope fib.k
 	cat fib.k | ./kaleidoscope
