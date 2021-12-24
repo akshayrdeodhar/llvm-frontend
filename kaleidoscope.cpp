@@ -145,19 +145,20 @@ class FunctionAST;
 class ASTVisitor {
 	public:
 
-		virtual void visit(NumExprAST *p_obj);
+		virtual void visit(NumExprAST *p_obj) = 0;
 
-		virtual void visit(VariableExprAST *p_obj);
+		virtual void visit(VariableExprAST *p_obj) = 0;
 
-		virtual void visit(CallExprAST *p_obj);
+		virtual void visit(CallExprAST *p_obj) = 0;
 
-		virtual void visit(FunctionAST *p_obj);
+		virtual void visit(FunctionAST *p_obj) = 0;
 
-		virtual void visit(PrototypeAST *p_obj);
+		virtual void visit(PrototypeAST *p_obj) = 0;
 
-		virtual void visit(BinaryExprAST *p_obj);
+		virtual void visit(BinaryExprAST *p_obj) = 0;
 
 };
+
 
 
 
@@ -167,6 +168,7 @@ class NumExprAST: public ExprAST {
 		public:
 				NumExprAST(double Val): Val(Val) {}
 				void accept(ASTVisitor& visitor) { visitor.visit(this); }
+				double GetVal() { return Val; }
 };
 
 
@@ -179,32 +181,38 @@ class VariableExprAST: public ExprAST {
 				// Reference used because the string is not going to be used later
 				// again, so why waste space? (and it's not going to be modified, so
 				// const
+				std::string& GetName() { return Name; }
 };
 
 class CallExprAST: public ExprAST {
 		private:
 				std::string Callee;
-				std::vector<std::unique_ptr <ExprAST> > Args;
 		public:
+				// TODO: figure out a way to keep this private
+				std::vector<std::unique_ptr <ExprAST> > Args;
+
 				CallExprAST(std::string &Callee, 
-								std::vector< std::unique_ptr <ExprAST> > Args):
-						Callee(Callee), Args(std::move(Args)) {}
+								std::vector< std::unique_ptr <ExprAST> > Args_):
+						Callee(Callee), Args(std::move(Args_)) {}
 				// TODO: figure out why I need to use move here (because vector itself
 				// is not a unique_ptr!, to get deleted before use)
 				// probably so because moving a vector does not move it's contents, just
 				// it's meta information, while moving a string moves its contents
 				void accept(ASTVisitor& visitor) { visitor.visit(this); }
+				std::string& GetCallee() { return Callee; }
 };
 
 class BinaryExprAST: public ExprAST {
 		private: 
 				char Op;
-				std::unique_ptr<ExprAST> LHS, RHS;
 		public:
+				// TODO: figure out a way to keep these private
+				std::unique_ptr<ExprAST> LHS, RHS;
 				BinaryExprAST(char Op, std::unique_ptr<ExprAST> LHS,
 								std::unique_ptr<ExprAST> RHS):
 						Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
 				void accept(ASTVisitor& visitor) { visitor.visit(this); }
+				char GetOp() { return Op; }
 };
 
 // Neither a prototype, nor a function is an "expression"
@@ -219,6 +227,8 @@ class PrototypeAST {
 						Name(Name), Args(std::move(Args)) {}
 
 				void accept(ASTVisitor& visitor) { visitor.visit(this); }
+				std::string& GetName() { return Name; }
+				std::vector<std::string>& GetArgs() { return Args; }
 };
 
 class FunctionAST {
@@ -226,9 +236,13 @@ class FunctionAST {
 				// this is a tree! these should be pointers to members!
 				// (a function should be an object pointing to these things, not an
 				// object *containing* these things
+		public:
+				// TODO: Figure out a way to make these
+				// unique_ptr members private, and still
+				// access them from the visitor 
 				std::unique_ptr<PrototypeAST> Proto;
 				std::unique_ptr<ExprAST> Body;
-		public:
+
 				FunctionAST(std::unique_ptr<PrototypeAST> Proto, 
 								std::unique_ptr<ExprAST> Body):
 						Proto(std::move(Proto)), Body(std::move(Body)) {}
@@ -281,6 +295,63 @@ std::unique_ptr<PrototypeAST> LogErrorP(const char *Str) {
 		LogError(Str);
 		return nullptr;
 }
+
+class LispPrintVisitor : public ASTVisitor {
+	public:
+
+		LispPrintVisitor(): nesting_depth(0) {}
+
+		void visit(NumExprAST *p_obj) {
+				std::cout << std::string(2 * nesting_depth, ' ') << p_obj->GetVal();
+		}
+
+		void visit(VariableExprAST *p_obj) {
+				std::cout << std::string(2 * nesting_depth, ' ') << p_obj->GetName();
+		}
+
+		void visit(CallExprAST *p_obj) {
+				std::cout << std::string(2 * nesting_depth, ' ') << '(' << p_obj->GetCallee();
+				++nesting_depth;
+				for (const auto& arg: p_obj->Args) {
+						std::cout << std::endl;
+						arg->accept(*this);
+				}
+				--nesting_depth;
+				std::cout << ')';
+		}
+
+		void visit(FunctionAST *p_obj) {
+				p_obj->Proto->accept(*this);
+				std::cout << std::endl;
+				++nesting_depth;
+				p_obj->Body->accept(*this);
+				--nesting_depth;
+		}
+
+		void visit(PrototypeAST *p_obj) {
+				std::cout << "(def (" << p_obj->GetName();
+				for (auto arg: p_obj->GetArgs()) {
+						std::cout << ' ' << arg;
+				}
+				std::cout << ')';
+		}
+
+		void visit(BinaryExprAST *p_obj) {
+				std::cout << std::string(2 * nesting_depth, ' ') << '(' << p_obj->GetOp() << std::endl;
+				++nesting_depth;
+				p_obj->LHS->accept(*this);
+				std::cout << std::endl;
+				p_obj->RHS->accept(*this);
+				--nesting_depth;
+				std::cout << ")";
+		}
+
+	private:
+		int nesting_depth;
+
+};
+
+
 
 
 static std::unique_ptr<ExprAST> ParseNumberExpr();
@@ -554,8 +625,11 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
 
 
 static void HandleDefinition() {
-		if (ParseDefinition()) {
-				fprintf(stderr, "Parsed a function definition\n");
+		LispPrintVisitor lvt;
+		auto def = ParseDefinition();
+		if (def) {
+				def->accept(lvt);
+				//fprintf(stderr, "Parsed a function definition\n");
 		}else {
 				getNextToken(); // skip token
 		}
@@ -563,16 +637,22 @@ static void HandleDefinition() {
 
 
 static void HandleExtern() {
-		if (ParseExtern()) {
-				fprintf(stderr, "Parsed an extern\n");
+		LispPrintVisitor lvt;
+		const auto extn = ParseExtern();
+		if (extn) {
+				extn->accept(lvt);
+				//fprintf(stderr, "Parsed an extern\n");
 		}else {
 				getNextToken();
 		}
 }
 
 static void HandleTopLevelExpression() {
-		if (ParseTopLevelExpr()) {
-				fprintf(stderr, "Parsed a top level expression\n");
+		LispPrintVisitor lvt;
+		const auto tle = ParseTopLevelExpr();
+		if (tle) {
+				tle->accept(lvt);
+				//fprintf(stderr, "Parsed a top level expression\n");
 		}else {
 				getNextToken();
 		}
@@ -581,7 +661,7 @@ static void HandleTopLevelExpression() {
 // top = definition | expression | external | ;
 static void MainLoop() {
 		while(1) {
-				fprintf(stderr, "ready>");
+				//fprintf(stderr, "ready>");
 				switch (CurTok) {
 						case tok_eof:
 								return;

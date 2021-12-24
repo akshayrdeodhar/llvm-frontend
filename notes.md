@@ -6,3 +6,5 @@
   itself is the expression
 - If the precedence of the next token is > required precedence, then process
   that expression, and then return (op, LHS, processed expr)
+
+- For accessing ptrs from a vector<unique_ptr<T>>, use for (const auto& x: vec)!
