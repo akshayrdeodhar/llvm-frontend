@@ -6,9 +6,15 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -18,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
+#include "./KaleidoscopeJIT.h"
 
 using namespace llvm;
 
@@ -107,9 +114,10 @@ static int gettok(void){
 
 
 // State variables
-static std::unique_ptr<IRBuilder<>> Builder; // for creating instructions, constants, etc
-static std::unique_ptr<Module> TheModule; // to hold blocks, definitions? (TODO), TODO: why does this have to be a pointer?
 static std::unique_ptr<LLVMContext> TheContext; 
+static std::unique_ptr<Module> TheModule; // to hold blocks, definitions? (TODO), TODO: why does this have to be a pointer?
+static std::unique_ptr<IRBuilder<>> Builder; // for creating instructions, constants, etc
+static std::unique_ptr<legacy::FunctionPassManager> TheFPM; // Function pass manager
 static std::unordered_map<std::string, Value *> Symbols; // Maps names inside function context to LLVM "values"
 
 
@@ -679,12 +687,6 @@ Value* VariableExprAST::codegen() {
 // Generates code for function call, returns `Value` of function call
 Value* CallExprAST::codegen() {
 
-	// Generate code for arguments, and get their values
-	std::vector<Value *> Argvec;
-	for (const auto& arg: Args) {
-		Argvec.push_back(arg->codegen());
-	}
-
 	// Obtain function with name `Callee` from Module
 	Function *func = TheModule->getFunction(Callee);
 	if (!func) {
@@ -699,8 +701,16 @@ Value* CallExprAST::codegen() {
 		);
 	}
 
+	// Generate code for arguments, and get their values
+	std::vector<Value *> Argvec;
+	for (const auto& arg: Args) {
+		Argvec.push_back(arg->codegen());
+	}
+
+
+
 	// TODO: why do I need to provide TheContext to getDoubleTy?
-	std::vector<Type *> ArgTypes = std::vector<Type *>(Args.size(), Builder->getDoubleTy());
+	//std::vector<Type *> ArgTypes = std::vector<Type *>(Args.size(), Builder->getDoubleTy());
 
 	// Create type for call
 	// TODO: this is not needed: CreateCall can be called without a type
@@ -708,7 +718,7 @@ Value* CallExprAST::codegen() {
 	//FunctionType *func_type = FunctionType::get(Builder->getDoubleTy(), ArgTypes, false);
 
 	// Create call
-	return Builder->CreateCall(func, Argvec, Callee);
+	return Builder->CreateCall(func, Argvec, "call");
 }
 
 Value* BinaryExprAST::codegen() {
@@ -742,6 +752,7 @@ Value* BinaryExprAST::codegen() {
 			return Builder->CreateUIToFP(L, Builder->getDoubleTy(), "booltofp");
 		default:
 			return LogErrorV("Invalid Operator");
+			break;
 	}
 }
 
@@ -796,6 +807,9 @@ Function* FunctionAST::codegen() {
 
 		// TODO: What if this check fails? Do I still continue?
 		verifyFunction(*func);
+
+		// Run passes on function
+		TheFPM->run(*func);
 
 		return func;
 	}
@@ -873,15 +887,32 @@ static void HandleTopLevelExpression() {
 		}
 }
 
-static void InitializeModule() {
+static void InitializeModuleAndPassManager() {
 	TheContext = std::make_unique<LLVMContext>();
 	TheModule = std::make_unique<Module>("kaleidoscope", *TheContext);
+	// Why .get? Ahh- I want to pass a pointer. What about uniqueness?
+	TheFPM = std::make_unique<legacy::FunctionPassManager>(TheModule.get());
 	Builder = std::make_unique<IRBuilder<>>(*TheContext);
+
+	// Peephole optimizations
+	TheFPM->add(createInstructionCombiningPass());
+	
+	// ?
+	TheFPM->add(createReassociatePass());
+
+	// Global value numbering-> common subexpression elimination. Global is actually per-function
+	TheFPM->add(createGVNPass());
+
+	// Dead code elimination pass;
+	TheFPM->add(createCFGSimplificationPass());
+
+	// Run initalizers for all passes added to pass manager
+	TheFPM->doInitialization();
 }
 
 // top = definition | expression | external | ;
 static void MainLoop() {
-	while(1) {
+	while(true) {
 		fprintf(stderr, "ready>");
 		switch (CurTok) {
 				case tok_eof:
@@ -940,12 +971,12 @@ int main(void) {
 		BinopPrecedence['*'] = 40;
 		BinopPrecedence['/'] = 40;
 
-#if IRGEN
-		InitializeModule();
-#endif
-
 		fprintf(stderr, "ready>");
 		getNextToken();
+
+#if IRGEN
+		InitializeModuleAndPassManager();
+#endif
 
 		MainLoop();
 		//oldmain();
