@@ -17,8 +17,13 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <unordered_map>
 
 using namespace llvm;
+
+#define IRGEN true
+
+// ---Lexer---
 
 typedef enum {
 		// EOF
@@ -100,6 +105,15 @@ static int gettok(void){
 		return tok_error;
 }
 
+
+// State variables
+static std::unique_ptr<IRBuilder<>> Builder; // for creating instructions, constants, etc
+static std::unique_ptr<Module> TheModule; // to hold blocks, definitions? (TODO), TODO: why does this have to be a pointer?
+static std::unique_ptr<LLVMContext> TheContext; 
+static std::unordered_map<std::string, Value *> Symbols; // Maps names inside function context to LLVM "values"
+
+
+
 // The different types of expressions:
 // 
 // ExprAST an expression a + f(b) + 5
@@ -118,6 +132,8 @@ static int gettok(void){
 // - f(a, b)
 //       a + f(b) + 5
 
+// --- AST ---
+
 class ASTVisitor;
 
 class ExprAST {
@@ -130,7 +146,11 @@ class ExprAST {
 				// TODO: throws "undefined reference to vtable for ExprAST" 
 				// if accept is not declared as pure virtual
 				// Why?
+				// Accept function for visitor pattern
 				virtual void accept(ASTVisitor& visitor) = 0;
+
+				// Generate code for sub-AST
+				virtual Value* codegen() = 0; 
 };
 
 class NumExprAST;
@@ -159,17 +179,34 @@ class ASTVisitor {
 
 };
 
+std::unique_ptr<ExprAST> LogError(const char *Str) {
+		fprintf(stderr, "LogError: %s\n", Str);
+		return nullptr;
+}
 
+// TODO: what is this for?
+std::unique_ptr<PrototypeAST> LogErrorP(const char *Str) {
+		LogError(Str);
+		return nullptr;
+}
 
+// For logging errors while doing codegeneration- returns a `null` value, and prints error
+Value *LogErrorV(const char *Str) {
+  LogError(Str);
+  return nullptr;
+}
 
 class NumExprAST: public ExprAST {
 		private: // default access is private, be explicit
 				double Val; 
 		public:
 				NumExprAST(double Val): Val(Val) {}
+				Value* codegen();
 				void accept(ASTVisitor& visitor) { visitor.visit(this); }
 				double GetVal() { return Val; }
 };
+
+
 
 
 class VariableExprAST: public ExprAST {
@@ -177,12 +214,15 @@ class VariableExprAST: public ExprAST {
 				std::string Name;
 		public:
 				VariableExprAST(const std::string &Name): Name(Name) {};
+				Value *codegen();
 				void accept(ASTVisitor& visitor) { visitor.visit(this); }
 				// Reference used because the string is not going to be used later
 				// again, so why waste space? (and it's not going to be modified, so
 				// const
 				std::string& GetName() { return Name; }
 };
+
+
 
 class CallExprAST: public ExprAST {
 		private:
@@ -198,6 +238,7 @@ class CallExprAST: public ExprAST {
 				// is not a unique_ptr!, to get deleted before use)
 				// probably so because moving a vector does not move it's contents, just
 				// it's meta information, while moving a string moves its contents
+				Value *codegen();
 				void accept(ASTVisitor& visitor) { visitor.visit(this); }
 				std::string& GetCallee() { return Callee; }
 };
@@ -211,6 +252,7 @@ class BinaryExprAST: public ExprAST {
 				BinaryExprAST(char Op, std::unique_ptr<ExprAST> LHS,
 								std::unique_ptr<ExprAST> RHS):
 						Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
+				Value *codegen();
 				void accept(ASTVisitor& visitor) { visitor.visit(this); }
 				char GetOp() { return Op; }
 };
@@ -225,6 +267,7 @@ class PrototypeAST {
 				PrototypeAST(const std::string &Name, 
 								std::vector< std::string> Args):
 						Name(Name), Args(std::move(Args)) {}
+				Function* codegen();
 
 				void accept(ASTVisitor& visitor) { visitor.visit(this); }
 				std::string& GetName() { return Name; }
@@ -250,8 +293,12 @@ class FunctionAST {
 				// that it will get deleted when it goes out of scope- *move* is used to
 				// indicate that I want to be a cannibal
 
+				Function* codegen();
+
 				void accept(ASTVisitor& visitor) { visitor.visit(this); }
 };
+
+
 
 static int CurTok;
 
@@ -278,6 +325,7 @@ static void print_tok() {
 		}
 }
 
+// -- Parser --
 
 int getNextToken() {
 		CurTok = gettok();
@@ -285,16 +333,7 @@ int getNextToken() {
 		return CurTok;
 }
 
-std::unique_ptr<ExprAST> LogError(const char *Str) {
-		fprintf(stderr, "LogError: %s\n", Str);
-		return nullptr;
-}
-
-// TODO: what is this for?
-std::unique_ptr<PrototypeAST> LogErrorP(const char *Str) {
-		LogError(Str);
-		return nullptr;
-}
+// LISP-like pretty-printer
 
 class LispPrintVisitor : public ASTVisitor {
 	public:
@@ -350,8 +389,6 @@ class LispPrintVisitor : public ASTVisitor {
 		int nesting_depth;
 
 };
-
-
 
 
 static std::unique_ptr<ExprAST> ParseNumberExpr();
@@ -514,10 +551,10 @@ static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec, std::unique_ptr<Expr
 
 				getNextToken(); // ate op
 
-				int NextOpPrec = getTokPrecedence();
-
 				//fprintf(stderr, "debug: Parsing RHS");
 				auto RHS = ParsePrimary(); // ate binoprhs
+
+				int NextOpPrec = getTokPrecedence();
 
 				if (!RHS)
 						return nullptr;
@@ -575,7 +612,6 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
 		return prot;
 }
 
-
 // definition:
 // 	::= 'def' prototype expression
 static std::unique_ptr<FunctionAST> ParseDefinition() {
@@ -623,13 +659,170 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
 		return nullptr;
 }
 
+// -- Code Generator --
+
+// Create a new constant of type "double"
+Value* NumExprAST::codegen() {
+	return ConstantFP::get(Builder->getDoubleTy(), Val);
+}
+
+
+// Return a pointer to the value that this variable refers to
+Value* VariableExprAST::codegen() {
+	Value *varval = Symbols[Name];
+	if (!varval) {
+		return LogErrorV((std::string("Undefined reference: ") + Name).c_str());
+	}
+	return varval;
+}
+
+// Generates code for function call, returns `Value` of function call
+Value* CallExprAST::codegen() {
+
+	// Generate code for arguments, and get their values
+	std::vector<Value *> Argvec;
+	for (const auto& arg: Args) {
+		Argvec.push_back(arg->codegen());
+	}
+
+	// Obtain function with name `Callee` from Module
+	Function *func = TheModule->getFunction(Callee);
+	if (!func) {
+		return LogErrorV((std::string("undefined function: ") + Callee).c_str());
+	}
+
+	// "Type Check" call
+	if (Args.size() != func->arg_size()) {
+		return LogErrorV((
+			std::string("Invalid number of arguments in function call to function") 
+			+ Callee).c_str()
+		);
+	}
+
+	// TODO: why do I need to provide TheContext to getDoubleTy?
+	std::vector<Type *> ArgTypes = std::vector<Type *>(Args.size(), Builder->getDoubleTy());
+
+	// Create type for call
+	// TODO: this is not needed: CreateCall can be called without a type
+	// Why is this so? Is it because the function does not take variable arguments?
+	//FunctionType *func_type = FunctionType::get(Builder->getDoubleTy(), ArgTypes, false);
+
+	// Create call
+	return Builder->CreateCall(func, Argvec, Callee);
+}
+
+Value* BinaryExprAST::codegen() {
+	Value *L = LHS->codegen();
+	Value *R = RHS->codegen();
+
+	if (!L || !R) {
+		return nullptr;
+	}
+
+	switch(Op) {
+		case '+':
+			return Builder->CreateFAdd(L, R, "add");
+			break;
+		case '-':
+			return Builder->CreateFSub(L, R, "sub");
+			break;
+		case '*':
+			return Builder->CreateFMul(L, R, "mul");
+			break;
+		case '/':
+			// TODO: do static analysis to ensure that RHS is not a 0?
+			return Builder->CreateFDiv(L, R, "div");
+			break;
+		case '<':
+			L = Builder->CreateFCmp(CmpInst::FCMP_OLT, L, R, "lessthan");
+			return Builder->CreateUIToFP(L, Builder->getDoubleTy(), "booltofp");
+			break;
+		case '>':
+			L = Builder->CreateFCmp(CmpInst::FCMP_UGT, L, R, "greaterthan");
+			return Builder->CreateUIToFP(L, Builder->getDoubleTy(), "booltofp");
+		default:
+			return LogErrorV("Invalid Operator");
+	}
+}
+
+Function* PrototypeAST::codegen() {
+	std::vector<Type *> Argtypes = std::vector<Type *>(Args.size(), Builder->getDoubleTy());
+
+	FunctionType *func_type = FunctionType::get(Builder->getDoubleTy(), Argtypes, false);
+
+	// TODO: why do I use TheModule.get() here? Why not *TheModule? how will things change due to this?
+	Function *func = Function::Create(func_type, Function::ExternalLinkage, Name, TheModule.get());
+	
+	unsigned Idx = 0;
+	for (Argument& x: func->args()) {
+		x.setName(Args[Idx++]);
+	}
+
+	return func;
+}
+
+Function* FunctionAST::codegen() {
+
+	// TODO: why are we doing this? This codegen method will never be called 
+	// for an extern function, right? Why else do I need to check?
+	Function *func = TheModule->getFunction(Proto->GetName());
+
+	if (!func) {
+		func = Proto->codegen();
+	}
+
+	if (!func) {
+		return nullptr;
+	}
+
+	BasicBlock *BB = BasicBlock::Create(*TheContext, "entry", func);
+	Builder->SetInsertPoint(BB);
+
+	Symbols.clear();
+	for (auto& arg: func->args()) {
+		// I could have used the AST to find the names- 
+		// but I've already stored this information in the function 
+		// prototype
+		Symbols[std::string(arg.getName())] = &arg;
+	}
+
+	Value *retval = Body->codegen();
+	if (retval) {
+		Builder->CreateRet(retval);
+		// TODO: Does this mean that my "write head" is at the end of the function-
+		// but I do not need to move it immediately, because the only place where
+		// writes will happen will be while generating code for another function,
+		// and I _will_ call SetInsertPoint in that function anyway?
+
+		// TODO: What if this check fails? Do I still continue?
+		verifyFunction(*func);
+
+		return func;
+	}
+
+	// For recovering from errors- improperly defined functions should not persist.
+	func->eraseFromParent();
+	return nullptr;
+}
+
+// --- Driver ---
 
 static void HandleDefinition() {
-		LispPrintVisitor lvt;
-		auto def = ParseDefinition();
-		if (def) {
+		if (auto def = ParseDefinition()) {
+
+#if DEBUGPARSE
+				LispPrintVisitor lvt;
 				def->accept(lvt);
-				//fprintf(stderr, "Parsed a function definition\n");
+#endif
+
+#if IRGEN
+				if (Function *func = def->codegen()) {
+					func->print(errs());
+					fprintf(stderr, "\n");
+					fprintf(stderr, "Read a function definition\n");
+				}
+#endif
+
 		}else {
 				getNextToken(); // skip token
 		}
@@ -637,49 +830,77 @@ static void HandleDefinition() {
 
 
 static void HandleExtern() {
-		LispPrintVisitor lvt;
-		const auto extn = ParseExtern();
-		if (extn) {
+		if (const auto extn = ParseExtern()) {
+
+#if DEBUGPARSE
+				LispPrintVisitor lvt;
 				extn->accept(lvt);
-				//fprintf(stderr, "Parsed an extern\n");
+#endif
+
+#if IRGEN
+				if (Function *func = extn->codegen()) {
+					func->print(errs());
+					fprintf(stderr, "\n");
+					fprintf(stderr, "Read an extern\n");
+				}
+#endif
+
 		}else {
 				getNextToken();
 		}
 }
 
 static void HandleTopLevelExpression() {
-		LispPrintVisitor lvt;
-		const auto tle = ParseTopLevelExpr();
-		if (tle) {
+		if (const auto tle = ParseTopLevelExpr()) {
+
+#if DEBUGPARSE
+				LispPrintVisitor lvt;
 				tle->accept(lvt);
-				//fprintf(stderr, "Parsed a top level expression\n");
-		}else {
+#endif
+
+#if IRGEN
+				if (Function *func = tle->codegen()) {
+					func->print(errs());
+					fprintf(stderr, "\n");
+					fprintf(stderr, "Parsed a top level expression\n");
+
+					func->eraseFromParent();
+				}
+#endif
+
+		} else {
 				getNextToken();
 		}
 }
 
+static void InitializeModule() {
+	TheContext = std::make_unique<LLVMContext>();
+	TheModule = std::make_unique<Module>("kaleidoscope", *TheContext);
+	Builder = std::make_unique<IRBuilder<>>(*TheContext);
+}
+
 // top = definition | expression | external | ;
 static void MainLoop() {
-		while(1) {
-				//fprintf(stderr, "ready>");
-				switch (CurTok) {
-						case tok_eof:
-								return;
-								break;
-						case tok_def:
-								HandleDefinition();
-								break;
-						case tok_extern:
-								HandleExtern();
-								break;
-						case ';':
-								getNextToken();
-								break;
-						default:
-								HandleTopLevelExpression();
-								break;
-				}
+	while(1) {
+		fprintf(stderr, "ready>");
+		switch (CurTok) {
+				case tok_eof:
+						return;
+						break;
+				case tok_def:
+						HandleDefinition();
+						break;
+				case tok_extern:
+						HandleExtern();
+						break;
+				case ';':
+						getNextToken();
+						break;
+				default:
+						HandleTopLevelExpression();
+						break;
 		}
+	}
 }
 
 
@@ -713,15 +934,28 @@ int oldmain(void) {
 
 int main(void) {
 		BinopPrecedence['>'] = 10;
+		BinopPrecedence['<'] = 10;
 		BinopPrecedence['+'] = 20;
 		BinopPrecedence['-'] = 20;
 		BinopPrecedence['*'] = 40;
+		BinopPrecedence['/'] = 40;
+
+#if IRGEN
+		InitializeModule();
+#endif
 
 		fprintf(stderr, "ready>");
 		getNextToken();
 
 		MainLoop();
 		//oldmain();
+
+#if IRGEN
+		verifyModule(*TheModule, &errs());
+
+		TheModule->print(errs(), nullptr);
+		fprintf(stderr, "\n");
+#endif
 
 		return 0;
 }
