@@ -47,4 +47,10 @@
   tokprec = 40, BinOp = *, o
 - The bug was: I was trying to look at precedence of next token before parsing the Primary Expression
 
-- 
+- How the "separate modules for each function" thing works: 
+> The final line above actually creates the IR Function corresponding to the
+> Prototype. This indicates the type, linkage and name to use, as well as which
+> module to insert into. “external linkage” means that the function may be defined
+> outside the current module and/or that it is callable by functions outside the
+> module. The Name passed in is the name the user specified: since “TheModule” is
+> specified, this name is registered in “TheModule”s symbol table.

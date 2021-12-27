@@ -1,3 +1,4 @@
+#include "KaleidoscopeJIT.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -24,9 +25,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
-#include "./KaleidoscopeJIT.h"
 
 using namespace llvm;
+
+using namespace llvm::orc;
 
 #define IRGEN true
 
@@ -119,6 +121,9 @@ static std::unique_ptr<Module> TheModule; // to hold blocks, definitions? (TODO)
 static std::unique_ptr<IRBuilder<>> Builder; // for creating instructions, constants, etc
 static std::unique_ptr<legacy::FunctionPassManager> TheFPM; // Function pass manager
 static std::unordered_map<std::string, Value *> Symbols; // Maps names inside function context to LLVM "values"
+static std::unique_ptr<KaleidoscopeJIT> TheJIT; // JIT engine for Kaleidoscope
+// Prototypes will be codegened in _each_ module, again and again? TODO: check
+static ExitOnError ExitOnErr;
 
 
 
@@ -658,7 +663,7 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
 
 		if (auto E = ParseExpression()) {
 
-				auto Proto = std::make_unique<PrototypeAST>("", std::vector<std::string>());
+				auto Proto = std::make_unique<PrototypeAST>("__anon_expr", std::vector<std::string>());
 
 				//fprintf(stderr, "debug: toplevelexpr\n");
 				return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
@@ -667,7 +672,52 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
 		return nullptr;
 }
 
+static std::unordered_map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos; // Function Name -> PrototypeAST Node map
+
 // -- Code Generator --
+
+static void InitializeModuleAndPassManager() {
+	TheContext = std::make_unique<LLVMContext>();
+	TheModule = std::make_unique<Module>("kaleidoscope", *TheContext);
+	TheModule->setDataLayout(TheJIT->getDataLayout());
+
+	Builder = std::make_unique<IRBuilder<>>(*TheContext);
+
+	// Why .get? Ahh- I want to pass a pointer. What about uniqueness?
+	TheFPM = std::make_unique<legacy::FunctionPassManager>(TheModule.get());
+
+	// Peephole optimizations
+	TheFPM->add(createInstructionCombiningPass());
+	
+	// ?
+	TheFPM->add(createReassociatePass());
+
+	// Global value numbering-> common subexpression elimination. Global is actually per-function
+	TheFPM->add(createGVNPass());
+
+	// Dead code elimination pass;
+	TheFPM->add(createCFGSimplificationPass());
+
+	// Run initalizers for all passes added to pass manager
+	TheFPM->doInitialization();
+}
+
+Function *getOrCreateFunction(const std::string& Name) {
+	// Check whether declaration is present in current module
+	if (auto *F = TheModule->getFunction(Name)) {
+		// Hypothesis: When each function is created in a new module, this will never happen
+		return F;
+	}
+
+	// Check whether this function has been declared previously
+	auto F_itr = FunctionProtos.find(Name);
+	if (F_itr != FunctionProtos.end()) {
+		// If yes, codegen declaration to _this module_.
+		return F_itr->second->codegen();
+	}
+
+	return nullptr;
+}
 
 // Create a new constant of type "double"
 Value* NumExprAST::codegen() {
@@ -688,7 +738,7 @@ Value* VariableExprAST::codegen() {
 Value* CallExprAST::codegen() {
 
 	// Obtain function with name `Callee` from Module
-	Function *func = TheModule->getFunction(Callee);
+	Function *func = getOrCreateFunction(Callee);
 	if (!func) {
 		return LogErrorV((std::string("undefined function: ") + Callee).c_str());
 	}
@@ -776,11 +826,13 @@ Function* FunctionAST::codegen() {
 
 	// TODO: why are we doing this? This codegen method will never be called 
 	// for an extern function, right? Why else do I need to check?
-	Function *func = TheModule->getFunction(Proto->GetName());
+	const std::string& func_name = Proto->GetName();
 
-	if (!func) {
-		func = Proto->codegen();
-	}
+	// Make global FunctionProto map the owner of function prototype node 
+	// This ensures that declaration can be codegened in different modules
+	FunctionProtos[func_name] = std::move(Proto);
+
+	Function *func = getOrCreateFunction(func_name);
 
 	if (!func) {
 		return nullptr;
@@ -832,6 +884,13 @@ static void HandleDefinition() {
 #if IRGEN
 				if (Function *func = def->codegen()) {
 					func->print(errs());
+
+					ExitOnErr(TheJIT->addModule(
+						ThreadSafeModule(std::move(TheModule), std::move(TheContext))
+					));
+
+					InitializeModuleAndPassManager();
+
 					fprintf(stderr, "\n");
 					fprintf(stderr, "Read a function definition\n");
 				}
@@ -844,7 +903,7 @@ static void HandleDefinition() {
 
 
 static void HandleExtern() {
-		if (const auto extn = ParseExtern()) {
+		if (auto extn = ParseExtern()) {
 
 #if DEBUGPARSE
 				LispPrintVisitor lvt;
@@ -856,6 +915,7 @@ static void HandleExtern() {
 					func->print(errs());
 					fprintf(stderr, "\n");
 					fprintf(stderr, "Read an extern\n");
+					FunctionProtos[extn->GetName()] = std::move(extn);
 				}
 #endif
 
@@ -878,7 +938,30 @@ static void HandleTopLevelExpression() {
 					fprintf(stderr, "\n");
 					fprintf(stderr, "Parsed a top level expression\n");
 
-					func->eraseFromParent();
+					// TODO: how do I know which functions to call? In this case, I have the 
+					// tutorial for reference. What if I don't know what does what?
+					auto RT = TheJIT->getMainJITDylib().createResourceTracker();
+
+					// TODO: wasn't the context supposed to be unique for the 
+					// program? If this context is now owned by the JIT, then
+					// will each top level expression (and even each function)
+					// be created in a new context?
+					auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+
+					ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
+
+					// Now, the next function will be placed in a new Module?
+					InitializeModuleAndPassManager();
+
+					auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
+
+					// TODO: why do I need intptr_t
+					double (*Fn)() = (double(*)())(intptr_t)ExprSymbol.getAddress();
+
+					fprintf(stderr, "Evaluated to %lf\n", Fn());
+
+					ExitOnErr(RT->remove());
+
 				}
 #endif
 
@@ -887,28 +970,6 @@ static void HandleTopLevelExpression() {
 		}
 }
 
-static void InitializeModuleAndPassManager() {
-	TheContext = std::make_unique<LLVMContext>();
-	TheModule = std::make_unique<Module>("kaleidoscope", *TheContext);
-	// Why .get? Ahh- I want to pass a pointer. What about uniqueness?
-	TheFPM = std::make_unique<legacy::FunctionPassManager>(TheModule.get());
-	Builder = std::make_unique<IRBuilder<>>(*TheContext);
-
-	// Peephole optimizations
-	TheFPM->add(createInstructionCombiningPass());
-	
-	// ?
-	TheFPM->add(createReassociatePass());
-
-	// Global value numbering-> common subexpression elimination. Global is actually per-function
-	TheFPM->add(createGVNPass());
-
-	// Dead code elimination pass;
-	TheFPM->add(createCFGSimplificationPass());
-
-	// Run initalizers for all passes added to pass manager
-	TheFPM->doInitialization();
-}
 
 // top = definition | expression | external | ;
 static void MainLoop() {
@@ -964,31 +1025,37 @@ int oldmain(void) {
 }
 
 int main(void) {
-		BinopPrecedence['>'] = 10;
-		BinopPrecedence['<'] = 10;
-		BinopPrecedence['+'] = 20;
-		BinopPrecedence['-'] = 20;
-		BinopPrecedence['*'] = 40;
-		BinopPrecedence['/'] = 40;
 
-		fprintf(stderr, "ready>");
-		getNextToken();
+	InitializeNativeTarget();
+	InitializeNativeTargetAsmParser();
+	InitializeNativeTargetAsmPrinter();
 
-#if IRGEN
-		InitializeModuleAndPassManager();
-#endif
+	BinopPrecedence['>'] = 10;
+	BinopPrecedence['<'] = 10;
+	BinopPrecedence['+'] = 20;
+	BinopPrecedence['-'] = 20;
+	BinopPrecedence['*'] = 40;
+	BinopPrecedence['/'] = 40;
 
-		MainLoop();
-		//oldmain();
+	fprintf(stderr, "ready>");
+	getNextToken();
 
 #if IRGEN
-		verifyModule(*TheModule, &errs());
-
-		TheModule->print(errs(), nullptr);
-		fprintf(stderr, "\n");
+	TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
+	InitializeModuleAndPassManager();
 #endif
 
-		return 0;
+	MainLoop();
+	//oldmain();
+
+#if IRGEN
+	verifyModule(*TheModule, &errs());
+
+	TheModule->print(errs(), nullptr);
+	fprintf(stderr, "\n");
+#endif
+
+	return 0;
 }
 
 
